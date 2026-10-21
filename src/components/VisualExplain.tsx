@@ -110,11 +110,13 @@ interface Insight {
  * completion and its estimate still deserves to be judged: a Seq Scan under
  * `Limit -> Sort` read the whole table. A Sort must finish sorting, a Hash must
  * build its whole table, and a Plain or Hashed aggregate must see every row before
- * it emits. A Sorted aggregate streams its groups and is not a barrier.
+ * it emits. A Hashed SetOp (`EXCEPT`, `INTERSECT`) builds its table the same way.
+ * A Sorted aggregate or SetOp streams its groups and is not a barrier.
  */
 function readsWholeInput(node: ExplainPlanNode): boolean {
   const nodeType = node["Node Type"] || "";
   if (nodeType === "Sort" || nodeType === "Hash") return true;
+  if (nodeType === "SetOp") return node["Strategy"] === "Hashed";
   return nodeType.includes("Aggregate") && (node["Strategy"] === "Plain" || node["Strategy"] === "Hashed");
 }
 

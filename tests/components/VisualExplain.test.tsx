@@ -423,6 +423,55 @@ describe("VisualExplain", () => {
     expect(queryByText("Estimate Mismatch")).not.toBeNull();
   });
 
+  test("still flags a mismatch on a scan below a Hashed SetOp under a Limit", () => {
+    // The plan PostgreSQL 18.6 gives `SELECT x FROM a EXCEPT SELECT x FROM b LIMIT 5`
+    // with stale statistics on `a`. A Hashed SetOp builds its table from the whole
+    // input before it returns a row, so the scan of `a` ran to completion.
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 5,
+          "Plan Rows": 5,
+          "Actual Total Time": 0.2,
+          "Total Cost": 1100,
+          Plans: [
+            {
+              "Node Type": "SetOp",
+              Strategy: "Hashed",
+              "Actual Rows": 5,
+              "Plan Rows": 50000,
+              "Actual Total Time": 0.2,
+              "Total Cost": 1099,
+              Plans: [
+                {
+                  "Node Type": "Seq Scan",
+                  "Relation Name": "a",
+                  "Actual Rows": 300,
+                  "Plan Rows": 50000,
+                  "Actual Total Time": 0.1,
+                  "Total Cost": 722,
+                },
+                {
+                  "Node Type": "Seq Scan",
+                  "Relation Name": "b",
+                  "Actual Rows": 100,
+                  "Plan Rows": 100,
+                  "Actual Total Time": 0.02,
+                  "Total Cost": 2,
+                },
+              ],
+            },
+          ],
+        },
+        "Execution Time": 0.2,
+        "Planning Time": 0.1,
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText(/Expected 50\.0K rows, got 300\./)).not.toBeNull();
+  });
+
   test("still flags an upward estimate mismatch under a Limit", () => {
     // 5,000 rows where the planner expected 100 is a misestimate whether or not a
     // Limit could have cut the node short: the node produced more, not fewer.
