@@ -210,6 +210,264 @@ describe("VisualExplain", () => {
     expect(queryByText(/Statistics may be outdated/)).not.toBeNull();
   });
 
+  // -----------------------------------------------------------------------
+  // Estimate Mismatch under a Limit (#1858)
+  //
+  // PostgreSQL presents a node's estimate as though the node ran to completion even
+  // when a Limit above it stopped it after a few rows (the manual's LIMIT example
+  // says so), so actual rows far below the estimate there says nothing about the
+  // statistics. Only the downward direction is excused; overrunning the estimate is
+  // still a real misestimate.
+  // -----------------------------------------------------------------------
+
+  /** `Limit -> Index Scan`: the scan's estimate is for running alone, the Limit stops it after 10 rows. */
+  function limitOverScan(actualRows: number, planRows: number): ExplainPlanResult[] {
+    return [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 10,
+          "Plan Rows": 10,
+          "Actual Total Time": 4.18,
+          "Total Cost": 25,
+          Plans: [
+            {
+              "Node Type": "Index Scan",
+              "Relation Name": "articles",
+              "Index Name": "articles_content_vector_idx",
+              "Actual Rows": actualRows,
+              "Plan Rows": planRows,
+              "Actual Total Time": 4.1,
+              "Total Cost": 24,
+            },
+          ],
+        },
+        "Execution Time": 4.18,
+        "Planning Time": 0.2,
+      },
+    ];
+  }
+
+  test("does not flag an estimate mismatch for a node a Limit stopped early", () => {
+    const { queryByText } = render(<VisualExplain plan={limitOverScan(10, 25000)} />);
+    expect(queryByText("Estimate Mismatch")).toBeNull();
+  });
+
+  test("does not flag a mismatch below a streaming aggregate under a Limit", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 10,
+          "Plan Rows": 10,
+          "Actual Total Time": 4.18,
+          "Total Cost": 25,
+          Plans: [
+            {
+              "Node Type": "GroupAggregate",
+              Strategy: "Sorted",
+              "Actual Rows": 10,
+              "Plan Rows": 10,
+              "Actual Total Time": 4.1,
+              "Total Cost": 24,
+              Plans: [
+                {
+                  "Node Type": "Index Scan",
+                  "Relation Name": "articles",
+                  "Actual Rows": 10,
+                  "Plan Rows": 25000,
+                  "Actual Total Time": 4,
+                  "Total Cost": 23,
+                },
+              ],
+            },
+          ],
+        },
+        "Execution Time": 4.18,
+        "Planning Time": 0.2,
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).toBeNull();
+  });
+
+  test("still flags a mismatch on a scan below a Sort, which read its whole input", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 10,
+          "Plan Rows": 10,
+          "Actual Total Time": 4.2,
+          "Total Cost": 30,
+          Plans: [
+            {
+              "Node Type": "Sort",
+              "Actual Rows": 10,
+              "Plan Rows": 10,
+              "Actual Total Time": 4,
+              "Total Cost": 29,
+              Plans: [
+                {
+                  "Node Type": "Seq Scan",
+                  "Relation Name": "articles",
+                  "Actual Rows": 10,
+                  "Plan Rows": 25000,
+                  "Actual Total Time": 3.5,
+                  "Total Cost": 20,
+                },
+              ],
+            },
+          ],
+        },
+        "Execution Time": 4.2,
+        "Planning Time": 0.2,
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+  });
+
+  test("still flags a mismatch on a scan below a Hash, which built from its whole input", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 10,
+          "Plan Rows": 10,
+          "Actual Total Time": 4.2,
+          "Total Cost": 30,
+          Plans: [
+            {
+              "Node Type": "Hash Join",
+              "Actual Rows": 10,
+              "Plan Rows": 10,
+              "Actual Total Time": 4,
+              "Total Cost": 29,
+              Plans: [
+                {
+                  "Node Type": "Hash",
+                  "Actual Rows": 25000,
+                  "Plan Rows": 25000,
+                  "Actual Total Time": 3,
+                  "Total Cost": 20,
+                  Plans: [
+                    {
+                      "Node Type": "Seq Scan",
+                      "Relation Name": "articles",
+                      "Actual Rows": 10,
+                      "Plan Rows": 25000,
+                      "Actual Total Time": 2.5,
+                      "Total Cost": 15,
+                    },
+                  ],
+                },
+                {
+                  "Node Type": "Seq Scan",
+                  "Relation Name": "titles",
+                  "Actual Rows": 10,
+                  "Plan Rows": 25000,
+                  "Actual Total Time": 0.5,
+                  "Total Cost": 5,
+                },
+              ],
+            },
+          ],
+        },
+        "Execution Time": 4.2,
+        "Planning Time": 0.2,
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    // The Hash's input ran to completion, so the inner scan is still judged. The
+    // outer scan's mismatch is excused by the Limit: its Hash Join streams rows.
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+    expect(queryByText(/Expected 25\.0K rows, got 10\./)).not.toBeNull();
+  });
+
+  test("still flags a mismatch on a scan below a Hashed aggregate under a Limit", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 10,
+          "Plan Rows": 10,
+          "Actual Total Time": 4.2,
+          "Total Cost": 30,
+          Plans: [
+            {
+              "Node Type": "Aggregate",
+              Strategy: "Hashed",
+              "Actual Rows": 10,
+              "Plan Rows": 10,
+              "Actual Total Time": 4,
+              "Total Cost": 29,
+              Plans: [
+                {
+                  "Node Type": "Seq Scan",
+                  "Relation Name": "articles",
+                  "Actual Rows": 10,
+                  "Plan Rows": 25000,
+                  "Actual Total Time": 3.5,
+                  "Total Cost": 20,
+                },
+              ],
+            },
+          ],
+        },
+        "Execution Time": 4.2,
+        "Planning Time": 0.2,
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+  });
+
+  test("still flags an upward estimate mismatch under a Limit", () => {
+    // 5,000 rows where the planner expected 100 is a misestimate whether or not a
+    // Limit could have cut the node short: the node produced more, not fewer.
+    const { queryByText } = render(<VisualExplain plan={limitOverScan(5000, 100)} />);
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+    expect(queryByText(/Expected 100 rows, got 5\.0K\./)).not.toBeNull();
+  });
+
+  test("a nested Limit still excuses the estimate of the node it stopped", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Actual Rows": 10,
+          "Plan Rows": 10,
+          "Actual Total Time": 4.18,
+          "Total Cost": 25,
+          Plans: [
+            {
+              "Node Type": "Limit",
+              "Actual Rows": 10,
+              "Plan Rows": 10,
+              "Actual Total Time": 4.18,
+              "Total Cost": 25,
+              Plans: [
+                {
+                  "Node Type": "Index Scan",
+                  "Relation Name": "articles",
+                  "Actual Rows": 10,
+                  "Plan Rows": 25000,
+                  "Actual Total Time": 4.1,
+                  "Total Cost": 24,
+                },
+              ],
+            },
+          ],
+        },
+        "Execution Time": 4.18,
+        "Planning Time": 0.2,
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).toBeNull();
+  });
+
   test('shows "Query looks good" for healthy plan', () => {
     const { queryByText } = render(<VisualExplain plan={healthyPlan} />);
     expect(queryByText("Query looks good")).not.toBeNull();

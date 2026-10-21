@@ -104,6 +104,20 @@ interface Insight {
   status: "good" | "warning" | "critical";
 }
 
+/**
+ * Whether this node consumes every input row before it can return its first one.
+ * Such a node cannot be cut short by a Limit above it, so its input ran to
+ * completion and its estimate still deserves to be judged: a Seq Scan under
+ * `Limit -> Sort` read the whole table. A Sort must finish sorting, a Hash must
+ * build its whole table, and a Plain or Hashed aggregate must see every row before
+ * it emits. A Sorted aggregate streams its groups and is not a barrier.
+ */
+function readsWholeInput(node: ExplainPlanNode): boolean {
+  const nodeType = node["Node Type"] || "";
+  if (nodeType === "Sort" || nodeType === "Hash") return true;
+  return nodeType.includes("Aggregate") && (node["Strategy"] === "Plain" || node["Strategy"] === "Hashed");
+}
+
 function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
   const warnings: Warning[] = [];
   const insights: Insight[] = [];
@@ -118,8 +132,10 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
   const totalCost = rootPlan?.["Total Cost"] || 0;
   const executed = rootPlan !== undefined && wasExecuted(rootPlan);
 
-  // Recursive node analysis
-  function analyzeNode(node: ExplainPlanNode, depth: number = 0) {
+  // Recursive node analysis. `stoppedByLimit` says an ancestor Limit can stop this
+  // node after a few rows: PostgreSQL then shows the node's estimate as though it ran
+  // to completion, so Actual Rows far below Plan Rows there is expected.
+  function analyzeNode(node: ExplainPlanNode, depth: number = 0, stoppedByLimit: boolean = false) {
     if (!node) return;
     nodeCount++;
 
@@ -144,10 +160,13 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
       });
     }
 
-    // Check for row estimate mismatch
+    // Check for row estimate mismatch. A Limit stops pulling after its own row count,
+    // so the nodes it cut short never produced the rows the planner expected; that
+    // says nothing about the statistics. Only the downward direction is excused:
+    // producing more rows than estimated is a real misestimate wherever it happens.
     if (planRows > 0 && actualRows > 0) {
       const ratio = actualRows / planRows;
-      if (ratio > 10 || ratio < 0.1) {
+      if (ratio > 10 || (ratio < 0.1 && !stoppedByLimit)) {
         warnings.push({
           type: "info",
           title: "Estimate Mismatch",
@@ -178,8 +197,11 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
       });
     }
 
-    // Recurse into children
-    (node["Plans"] || []).forEach((child) => analyzeNode(child, depth + 1));
+    // Recurse into children. A barrier reads all of its input before returning a row,
+    // so it shields its own children from the Limit above: `Limit -> Sort -> Seq Scan`
+    // still judged the scan. A nested Limit passes the excuse along.
+    const childStoppedByLimit = readsWholeInput(node) ? false : stoppedByLimit || nodeType.includes("Limit");
+    (node["Plans"] || []).forEach((child) => analyzeNode(child, depth + 1, childStoppedByLimit));
   }
 
   if (rootPlan) {

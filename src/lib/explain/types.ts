@@ -15,6 +15,7 @@ export type ExplainPlanNode = {
   "Actual Loops"?: number;
   Filter?: string;
   "Index Name"?: string;
+  Strategy?: string;
   Plans?: ExplainPlanNode[];
 };
 
